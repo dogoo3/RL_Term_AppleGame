@@ -3,7 +3,7 @@ import random
 import time
 from collections import deque
 from pathlib import Path
-from typing import Deque, Dict, List, Optional, Tuple, Union
+from typing import Deque, Dict, List, Optional, Set, Tuple, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -70,18 +70,26 @@ class AppleGameEnv:
         rect = self.action_rectangles[action_index]
         top, left, bottom, right = rect
         subgrid = self.grid[top : bottom + 1, left : right + 1]
-        non_zero_cells = np.count_nonzero(subgrid)
+        non_zero_cells = np.count_nonzero(subgrid) # 카운트 개수
         rect_sum = int(np.sum(subgrid))
 
         reward = -0.2
-        if non_zero_cells == 0:
-            reward = -1.0
+        # print(f"rect_sum : {rect_sum}")
+        if rect_sum == 0: # 빈 그리드를 드래그했을 때 감점을 매우 크게 준다
+            reward = -20.0
+            # print("빈 그리드를 드래그했다")
         elif rect_sum == 10:
             reward = 5.0 + float(non_zero_cells)
-            self.grid[top : bottom + 1, left : right + 1] = self._sample_new_values(rect)
+            self.grid[top : bottom + 1, left : right + 1] = 0
+            # print(f"--- {self.step_count}회 게임판 상태 ---")
+            # for row in self.grid:
+            #     print(row)
+            # print("맞추었다!")
+            # time.sleep(2)
 
         self.step_count += 1
         done = self.step_count >= self.max_steps
+
         return self.grid_to_state(self.grid), reward, done, {"rect_sum": rect_sum, "rect": rect}
 
     def valid_actions_for_grid(self, grid: List[List[int]]) -> List[int]:
@@ -100,28 +108,78 @@ class AppleGameEnv:
         return [left, top], [right, bottom]
 
 
-class ReplayBuffer:
-    """Simple replay buffer for off-policy learning."""
+class PrioritizedReplayBuffer:
+    """Prioritized replay buffer with proportional sampling."""
 
-    def __init__(self, capacity: int) -> None:
-        self.buffer: Deque[Tuple[np.ndarray, int, float, np.ndarray, bool]] = deque(maxlen=capacity)
+    def __init__(
+        self,
+        capacity: int,
+        alpha: float = 0.6,
+        beta_start: float = 0.4,
+        beta_frames: int = 100_000,
+    ) -> None:
+        self.capacity = capacity
+        self.alpha = alpha
+        self.beta_start = beta_start
+        self.beta_frames = beta_frames
+        self.buffer: List[Optional[Tuple[np.ndarray, int, float, np.ndarray, bool]]] = [None] * capacity
+        self.priorities = np.zeros(capacity, dtype=np.float32)
+        self.pos = 0
+        self.size = 0
+        self.frame = 1
 
     def __len__(self) -> int:
-        return len(self.buffer)
+        return self.size
 
     def push(self, state: np.ndarray, action: int, reward: float, next_state: np.ndarray, done: bool) -> None:
-        self.buffer.append((state, action, reward, next_state, done))
+        self.buffer[self.pos] = (state, action, reward, next_state, done)
+        max_pr = self.priorities[: self.size].max() if self.size > 0 else 1.0
+        self.priorities[self.pos] = max_pr if max_pr > 0 else 1.0
+        self.pos = (self.pos + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
 
-    def sample(self, batch_size: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        transitions = random.sample(self.buffer, batch_size)
-        state, action, reward, next_state, done = zip(*transitions)
+    def sample(
+        self, batch_size: int
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        if self.size == self.capacity:
+            priorities = self.priorities
+        else:
+            priorities = self.priorities[: self.size]
+
+        scaled_pr = priorities ** self.alpha
+        total = scaled_pr.sum()
+        if total <= 0:
+            scaled_pr = np.ones_like(scaled_pr) / len(scaled_pr)
+        else:
+            scaled_pr = scaled_pr / total
+
+        indices = np.random.choice(self.size, batch_size, p=scaled_pr)
+        samples = [self.buffer[idx] for idx in indices]
+        state, action, reward, next_state, done = zip(*samples)  # type: ignore[arg-type]
+
+        beta = self._beta_by_frame()
+        weights = (self.size * scaled_pr[indices]) ** (-beta)
+        weights = weights / weights.max()
+
         return (
             np.stack(state),
             np.array(action),
             np.array(reward, dtype=np.float32),
             np.stack(next_state),
             np.array(done, dtype=np.float32),
+            indices,
+            weights.astype(np.float32),
         )
+
+    def _beta_by_frame(self) -> float:
+        beta = min(1.0, self.beta_start + (1.0 - self.beta_start) * (self.frame / self.beta_frames))
+        self.frame += 1
+        return beta
+
+    def update_priorities(self, indices: np.ndarray, errors: np.ndarray) -> None:
+        errors = np.abs(errors) + 1e-5
+        for idx, err in zip(indices, errors):
+            self.priorities[idx] = float(err)
 
 
 class QNetwork(nn.Module):
@@ -159,6 +217,9 @@ class DQNAgent:
         epsilon_end: float = 0.15,
         epsilon_decay: float = 0.995,
         target_update_interval: int = 10,
+        prio_alpha: float = 0.6,
+        prio_beta_start: float = 0.4,
+        prio_beta_frames: int = 50_000,
     ) -> None:
         self.state_size = state_size
         self.action_size = action_size
@@ -177,8 +238,9 @@ class DQNAgent:
         self.target_net.eval()
 
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=lr)
-        self.criterion = nn.MSELoss()
-        self.buffer = ReplayBuffer(buffer_size)
+        self.buffer = PrioritizedReplayBuffer(
+            buffer_size, alpha=prio_alpha, beta_start=prio_beta_start, beta_frames=prio_beta_frames
+        )
         self.train_steps = 0
 
     def select_action(self, state: np.ndarray, explore: bool = True) -> int:
@@ -212,12 +274,21 @@ class DQNAgent:
         if len(self.buffer) < self.batch_size:
             return None
 
-        states, actions, rewards, next_states, dones = self.buffer.sample(self.batch_size)
+        (
+            states,
+            actions,
+            rewards,
+            next_states,
+            dones,
+            indices,
+            weights,
+        ) = self.buffer.sample(self.batch_size)
         states_tensor = torch.tensor(states, dtype=torch.float32, device=self.device)
         actions_tensor = torch.tensor(actions, dtype=torch.int64, device=self.device).unsqueeze(1)
         rewards_tensor = torch.tensor(rewards, dtype=torch.float32, device=self.device).unsqueeze(1)
         next_states_tensor = torch.tensor(next_states, dtype=torch.float32, device=self.device)
         dones_tensor = torch.tensor(dones, dtype=torch.float32, device=self.device).unsqueeze(1)
+        weights_tensor = torch.tensor(weights, dtype=torch.float32, device=self.device).unsqueeze(1)
 
         q_values = self.policy_net(states_tensor).gather(1, actions_tensor)
         with torch.no_grad():
@@ -226,11 +297,13 @@ class DQNAgent:
             next_q_values = self.target_net(next_states_tensor).gather(1, next_policy_actions)
             targets = rewards_tensor + self.gamma * next_q_values * (1 - dones_tensor)
 
-        loss = self.criterion(q_values, targets)
+        td_errors = targets - q_values
+        loss = (weights_tensor * (td_errors ** 2)).mean()
         self.optimizer.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=5.0)
         self.optimizer.step()
+        self.buffer.update_priorities(indices, td_errors.detach().cpu().numpy().squeeze())
 
         self.train_steps += 1
         if self.train_steps % self.target_update_interval == 0:
@@ -424,6 +497,9 @@ class Reinforcement:
             "    targets = rewards_tensor + self.gamma * next_q_values * (1 - dones_tensor)",
             "```",
             "",
+            "Prioritized Experience Replay를 도입하여 TD-error가 큰 전이 샘플일수록 자주 학습하고,",
+            "중복 샘플링 편향은 중요도 가중치로 보정했습니다.",
+            "",
             "## 학습 결과",
             f"- 총 Episode: {stats['episode_count']}",
             f"- 평균 Reward: {avg_reward:.2f}",
@@ -460,40 +536,61 @@ class Reinforcement:
         if self.grid is None:
             print("실시간 게임을 위한 grid 정보가 없습니다.")
             return
-        grid = self._sanitize_grid(self.grid)
+        # grid = self._sanitize_grid(self.grid)
         print("학습된 정책으로 실시간 게임을 실행합니다.")
         start_time = time.time()
         actions_taken = 0
         recent_rects: Deque[Tuple[int, int, int, int]] = deque(maxlen=5)
+        stale_rect_states: Dict[Tuple[int, int, int, int], Tuple[int, ...]] = {}
+        empty_rects: Set[Tuple[int, int, int, int]] = set()
+        cleared_cells: Set[Tuple[int, int]] = set()
 
         while (time.time() - start_time) < self.runtime_limit and actions_taken < self.max_live_actions:
-            valid_actions = self.env.valid_actions_for_grid(grid)
+            valid_actions = self.env.valid_actions_for_grid(self.grid)
             if not valid_actions:
                 print("합이 10인 조합이 더 이상 없습니다.")
                 break
 
-            action_index = self._select_live_action(grid, valid_actions, recent_rects)
+            action_index = self._select_live_action(
+                self.grid, valid_actions, recent_rects, stale_rect_states, empty_rects, cleared_cells
+            )
             if action_index is None:
                 print("정책이 유효한 행동을 찾지 못했습니다.")
                 break
 
             rect = self.env.action_rectangles[action_index]
             start_idx, end_idx = self.env.rect_to_indices(rect)
-            if not self._is_sum_ten(grid, rect):
-                # grid 오차로 인해 잘못된 행동을 선택한 경우 최신 스크린샷을 확보한다.
-                grid = self._capture_grid() or grid
+            rect_snapshot = self._rect_snapshot(self.grid, rect)
+            if self._is_empty_snapshot(rect_snapshot):
+                empty_rects.add(rect)
                 continue
+            # if not self._is_sum_ten(grid, rect):
+            #     # grid 오차로 인해 잘못된 행동을 선택한 경우 최신 스크린샷을 확보한다.
+            #     grid = self._capture_grid() or grid
+            #     continue
 
+            stale_rect_states[rect] = rect_snapshot
+            if self._is_sum_ten(self.grid, rect):
+                for cell in self._rect_cells(rect):
+                    cleared_cells.add(cell)
             self.drag(start_idx, end_idx)
             self.check_ten(start_idx, end_idx)
             actions_taken += 1
             recent_rects.append(rect)
             time.sleep(self.drag_delay)
-            latest_grid = self._capture_grid()
-            if latest_grid is None:
-                print("그리드 인식 실패로 자동 수행을 종료합니다.")
-                break
-            grid = latest_grid
+            # latest_grid = self._capture_grid()
+            # if latest_grid is None:
+            #     print("그리드 인식 실패로 자동 수행을 종료합니다.")
+            #     break
+            # grid = latest_grid
+            updated_snapshot = self._rect_snapshot(self.grid, rect)
+            if stale_rect_states.get(rect) != updated_snapshot:
+                stale_rect_states.pop(rect, None)
+            if self._is_empty_snapshot(updated_snapshot):
+                empty_rects.add(rect)
+            else:
+                empty_rects.discard(rect)
+            cleared_cells = self._filter_cleared_cells(cleared_cells, self.grid)
 
             
             if self.grid:
@@ -525,23 +622,92 @@ class Reinforcement:
             sanitized.append([int(val) if int(val) > 0 else 0 for val in row])
         return sanitized
 
-    def _select_live_action(
-        self, grid: List[List[int]], valid_actions: List[int], recent_rects: Deque[Tuple[int, int, int, int]]
+    def _select_live_action( # 다음 액션을 선택하는 로직이 들어간 함수
+        self,
+        grid: List[List[int]],
+        valid_actions: List[int],
+        recent_rects: Deque[Tuple[int, int, int, int]],
+        stale_rect_states: Dict[Tuple[int, int, int, int], Tuple[int, ...]],
+        empty_rects: Set[Tuple[int, int, int, int]],
+        cleared_cells: Set[Tuple[int, int]],
     ) -> Optional[int]:
         avoid_set = set(recent_rects)
-        filtered_actions = [idx for idx in valid_actions if self.env.action_rectangles[idx] not in avoid_set]
-        candidate_actions = filtered_actions or valid_actions
+        candidate_actions: List[int] = []
+        for idx in valid_actions:
+            rect = self.env.action_rectangles[idx]
+            # print(rect)
+            if rect in avoid_set:
+                continue
+            if rect in empty_rects:
+                continue
+            start_cell = (rect[0], rect[1])
+            if start_cell in cleared_cells:
+                continue
+            if self._rect_contains_cleared(rect, cleared_cells):
+                continue
+            if self._rect_has_zero(grid, rect):
+                continue
+            snapshot = self._rect_snapshot(grid, rect)
+            previous = stale_rect_states.get(rect)
+            if previous is not None and previous == snapshot:
+                continue
+            candidate_actions.append(idx)
+        if not candidate_actions:
+            candidate_actions = valid_actions
         state = self.env.grid_to_state(grid)
         return self.agent.select_best_from_valid(state, candidate_actions)
 
+    def _rect_snapshot(self, grid: List[List[int]], rect: Tuple[int, int, int, int]) -> Tuple[int, ...]:
+        top, left, bottom, right = rect
+        values: List[int] = []
+        for row in range(top, bottom + 1):
+            values.extend(grid[row][left : right + 1])
+        return tuple(values)
+
+    def _is_empty_snapshot(self, snapshot: Tuple[int, ...]) -> bool:
+        return all(value == 0 for value in snapshot)
+
+    def _rect_cells(self, rect: Tuple[int, int, int, int]) -> List[Tuple[int, int]]:
+        top, left, bottom, right = rect
+        cells: List[Tuple[int, int]] = []
+        for row in range(top, bottom + 1):
+            for col in range(left, right + 1):
+                cells.append((row, col))
+        return cells
+
+    def _filter_cleared_cells(self, cleared: Set[Tuple[int, int]], grid: List[List[int]]) -> Set[Tuple[int, int]]:
+        remaining: Set[Tuple[int, int]] = set()
+        for cell in cleared:
+            row, col = cell
+            if 0 <= row < len(grid) and 0 <= col < len(grid[0]) and grid[row][col] == 0:
+                remaining.add(cell)
+        return remaining
+
+    def _rect_contains_cleared(self, rect: Tuple[int, int, int, int], cleared: Set[Tuple[int, int]]) -> bool:
+        top, left, bottom, right = rect
+        for row in range(top, bottom + 1):
+            for col in range(left, right + 1):
+                if (row, col) in cleared:
+                    return True
+        return False
+
+    def _rect_has_zero(self, grid:List[List[int]], rect:Tuple[int, int, int, int]) -> bool:
+        top, left, bottom, right = rect
+        for row in range(top, bottom + 1):
+            for col in range(left, right + 1):
+                print(f"{row}-{col} : {grid[row][col]}")
+                if grid[row][col] == 0:
+                    return True
+        return False
+
     def drag(self, start_grid_index: List[int], end_grid_index: List[int]) -> None:
         duration = (end_grid_index[0] - start_grid_index[0] + 1) * (end_grid_index[1] - start_grid_index[1] + 1)
-        if duration <= 3:
-            duration = 2.0
+        if duration <= 2:
+            duration = 0.8
         elif duration <= 5:
-            duration = 2.5
+            duration = 1.7
         else:
-            duration = 3.0
+            duration = 2.3
         mousecontrol.Drag_pos(
             self.LU_X + self.grid_unit_size * start_grid_index[0],
             self.LU_Y + self.grid_unit_size * start_grid_index[1],

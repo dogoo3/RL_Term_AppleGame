@@ -17,11 +17,14 @@ with torch.no_grad():
     targets = rewards_tensor + self.gamma * next_q_values * (1 - dones_tensor)
 ```
 
+Prioritized Experience Replay를 도입하여 TD-error가 큰 전이 샘플일수록 자주 학습하고,
+중복 샘플링 편향은 중요도 가중치로 보정했습니다.
+
 ## 학습 결과
-- 총 Episode: 500
-- 평균 Reward: -21.38
-- 최고 Reward: 6.80
-- 학습 시간: 102.5 초
+- 총 Episode: 2000
+- 평균 Reward: -30.04
+- 최고 Reward: 0.60
+- 학습 시간: 576.2 초
 
 ![training curve](training_curve.png)
 
