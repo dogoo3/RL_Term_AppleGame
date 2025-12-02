@@ -4,24 +4,24 @@
 - Deep Q-Network (DQN)을 사용하여 사각형 행동 공간을 학습했습니다.
 
 ## 학습 수식
-DQN은 아래의 Bellman optimality를 목표로 하여 가중치를 업데이트합니다.
+Double DQN을 사용하여 정책망으로 행동을 고르고 타깃망으로 가치를 평가합니다.
 
-\[ y = r + \gamma \max_{a'} Q_{\text{target}}(s', a') \]
+\[ y = r + \gamma Q_{\text{target}}\!\bigl(s', \arg\max_{a'} Q_{\text{policy}}(s', a')\bigr) \]
 
 위 수식은 `reinforcement.py`의 `DQNAgent.train_step`에서 아래 코드로 구현되었습니다.
 
 ```python
 with torch.no_grad():
-    next_q_values = self.target_net(next_states_tensor).max(1, keepdim=True)[0]
+    next_policy_actions = self.policy_net(next_states_tensor).argmax(1, keepdim=True)
+    next_q_values = self.target_net(next_states_tensor).gather(1, next_policy_actions)
     targets = rewards_tensor + self.gamma * next_q_values * (1 - dones_tensor)
-loss = self.criterion(q_values, targets)
 ```
 
 ## 학습 결과
-- 총 Episode: 5000
-- 평균 Reward: -1379.26
-- 최고 Reward: -67.70
-- 학습 시간: 19862.1 초
+- 총 Episode: 500
+- 평균 Reward: -21.38
+- 최고 Reward: 6.80
+- 학습 시간: 102.5 초
 
 ![training curve](training_curve.png)
 

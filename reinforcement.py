@@ -75,12 +75,10 @@ class AppleGameEnv:
 
         reward = -0.2
         if non_zero_cells == 0:
-            reward = -0.5
+            reward = -1.0
         elif rect_sum == 10:
-            reward = float(non_zero_cells)
+            reward = 5.0 + float(non_zero_cells)
             self.grid[top : bottom + 1, left : right + 1] = self._sample_new_values(rect)
-        else:
-            reward = -0.1 * abs(10 - rect_sum)
 
         self.step_count += 1
         done = self.step_count >= self.max_steps
@@ -158,7 +156,7 @@ class DQNAgent:
         batch_size: int = 64,
         buffer_size: int = 60_000,
         epsilon_start: float = 1.0,
-        epsilon_end: float = 0.05,
+        epsilon_end: float = 0.15,
         epsilon_decay: float = 0.995,
         target_update_interval: int = 10,
     ) -> None:
@@ -223,7 +221,9 @@ class DQNAgent:
 
         q_values = self.policy_net(states_tensor).gather(1, actions_tensor)
         with torch.no_grad():
-            next_q_values = self.target_net(next_states_tensor).max(1, keepdim=True)[0]
+            # Double DQN: select greedy actions with the policy net, evaluate with the target net.
+            next_policy_actions = self.policy_net(next_states_tensor).argmax(1, keepdim=True)
+            next_q_values = self.target_net(next_states_tensor).gather(1, next_policy_actions)
             targets = rewards_tensor + self.gamma * next_q_values * (1 - dones_tensor)
 
         loss = self.criterion(q_values, targets)
@@ -411,17 +411,17 @@ class Reinforcement:
             "- Deep Q-Network (DQN)을 사용하여 사각형 행동 공간을 학습했습니다.",
             "",
             "## 학습 수식",
-            "DQN은 아래의 Bellman optimality를 목표로 하여 가중치를 업데이트합니다.",
+            "Double DQN을 사용하여 정책망으로 행동을 고르고 타깃망으로 가치를 평가합니다.",
             "",
-            r"\[ y = r + \gamma \max_{a'} Q_{\text{target}}(s', a') \]",
+            r"\[ y = r + \gamma Q_{\text{target}}\!\bigl(s', \arg\max_{a'} Q_{\text{policy}}(s', a')\bigr) \]",
             "",
             "위 수식은 `reinforcement.py`의 `DQNAgent.train_step`에서 아래 코드로 구현되었습니다.",
             "",
             "```python",
             "with torch.no_grad():",
-            "    next_q_values = self.target_net(next_states_tensor).max(1, keepdim=True)[0]",
+            "    next_policy_actions = self.policy_net(next_states_tensor).argmax(1, keepdim=True)",
+            "    next_q_values = self.target_net(next_states_tensor).gather(1, next_policy_actions)",
             "    targets = rewards_tensor + self.gamma * next_q_values * (1 - dones_tensor)",
-            "loss = self.criterion(q_values, targets)",
             "```",
             "",
             "## 학습 결과",
@@ -464,6 +464,7 @@ class Reinforcement:
         print("학습된 정책으로 실시간 게임을 실행합니다.")
         start_time = time.time()
         actions_taken = 0
+        recent_rects: Deque[Tuple[int, int, int, int]] = deque(maxlen=5)
 
         while (time.time() - start_time) < self.runtime_limit and actions_taken < self.max_live_actions:
             valid_actions = self.env.valid_actions_for_grid(grid)
@@ -471,8 +472,7 @@ class Reinforcement:
                 print("합이 10인 조합이 더 이상 없습니다.")
                 break
 
-            state = self.env.grid_to_state(grid)
-            action_index = self.agent.select_best_from_valid(state, valid_actions)
+            action_index = self._select_live_action(grid, valid_actions, recent_rects)
             if action_index is None:
                 print("정책이 유효한 행동을 찾지 못했습니다.")
                 break
@@ -486,8 +486,8 @@ class Reinforcement:
 
             self.drag(start_idx, end_idx)
             self.check_ten(start_idx, end_idx)
-
             actions_taken += 1
+            recent_rects.append(rect)
             time.sleep(self.drag_delay)
             latest_grid = self._capture_grid()
             if latest_grid is None:
@@ -525,14 +525,23 @@ class Reinforcement:
             sanitized.append([int(val) if int(val) > 0 else 0 for val in row])
         return sanitized
 
+    def _select_live_action(
+        self, grid: List[List[int]], valid_actions: List[int], recent_rects: Deque[Tuple[int, int, int, int]]
+    ) -> Optional[int]:
+        avoid_set = set(recent_rects)
+        filtered_actions = [idx for idx in valid_actions if self.env.action_rectangles[idx] not in avoid_set]
+        candidate_actions = filtered_actions or valid_actions
+        state = self.env.grid_to_state(grid)
+        return self.agent.select_best_from_valid(state, candidate_actions)
+
     def drag(self, start_grid_index: List[int], end_grid_index: List[int]) -> None:
         duration = (end_grid_index[0] - start_grid_index[0] + 1) * (end_grid_index[1] - start_grid_index[1] + 1)
         if duration <= 3:
-            duration = 0.5
-        elif duration <= 5:
-            duration = 1.5
-        else:
             duration = 2.0
+        elif duration <= 5:
+            duration = 2.5
+        else:
+            duration = 3.0
         mousecontrol.Drag_pos(
             self.LU_X + self.grid_unit_size * start_grid_index[0],
             self.LU_Y + self.grid_unit_size * start_grid_index[1],
